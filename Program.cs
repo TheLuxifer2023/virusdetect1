@@ -7,6 +7,7 @@ using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging.EventLog;
+using System.Runtime.InteropServices;
 
 namespace VirusDetect
 {
@@ -279,13 +280,15 @@ namespace VirusDetect
                     
                     if (IsSuspiciousProcess(process, out string reason))
                     {
+                        var processPath = GetProcessPath(process);
                         var suspiciousProcess = new SuspiciousProcess
                         {
                             ProcessName = process.ProcessName,
                             ProcessId = process.Id,
-                            MainModulePath = GetProcessPath(process),
+                            MainModulePath = processPath,
                             DetectionReason = reason,
-                            DetectionTime = DateTime.Now
+                            DetectionTime = DateTime.Now,
+                            FileProperties = GetFileProperties(processPath ?? "")
                         };
                         
                         suspiciousProcesses.Add(suspiciousProcess);
@@ -406,6 +409,21 @@ namespace VirusDetect
                     }
                 }
                 
+                // Проверяем свойства файла (Type, File version, Original filename)
+                if (_configService.CheckFileProperties && !string.IsNullOrEmpty(processPath))
+                {
+                    var fileProps = GetFileProperties(processPath);
+                    if (fileProps != null)
+                    {
+                        // Проверяем подозрительные свойства файла
+                        if (IsSuspiciousFileProperties(fileProps, out string fileReason))
+                        {
+                            reason = $"Подозрительные свойства файла: {fileReason}";
+                            return true;
+                        }
+                    }
+                }
+                
                 return false;
             }
             catch
@@ -452,6 +470,113 @@ namespace VirusDetect
             }
             return null;
         }
+
+        private FileProperties? GetFileProperties(string filePath)
+        {
+            try
+            {
+                if (string.IsNullOrEmpty(filePath) || !File.Exists(filePath))
+                    return null;
+
+                var fileInfo = FileVersionInfo.GetVersionInfo(filePath);
+                
+                return new FileProperties
+                {
+                    Type = GetFileType(filePath),
+                    FileVersion = fileInfo.FileVersion,
+                    OriginalFilename = fileInfo.OriginalFilename,
+                    CompanyName = fileInfo.CompanyName,
+                    ProductName = fileInfo.ProductName,
+                    Description = fileInfo.FileDescription
+                };
+            }
+            catch (Exception ex)
+            {
+                _logger.LogDebug(ex, "Не удалось получить свойства файла: {FilePath}", filePath);
+                return null;
+            }
+        }
+
+        private string GetFileType(string filePath)
+        {
+            try
+            {
+                var extension = Path.GetExtension(filePath).ToLower();
+                return extension switch
+                {
+                    ".exe" => "Application",
+                    ".dll" => "Dynamic Link Library",
+                    ".sys" => "System File",
+                    ".ocx" => "ActiveX Control",
+                    ".cpl" => "Control Panel",
+                    ".scr" => "Screen Saver",
+                    ".com" => "Command",
+                    ".bat" => "Batch File",
+                    ".cmd" => "Command Script",
+                    ".msi" => "Windows Installer Package",
+                    ".msu" => "Windows Update Package",
+                    _ => "Unknown"
+                };
+            }
+            catch
+            {
+                return "Unknown";
+            }
+        }
+
+        private bool IsSuspiciousFileProperties(FileProperties fileProps, out string reason)
+        {
+            reason = "";
+            
+            try
+            {
+                // Проверяем подозрительные паттерны в свойствах файла
+                var suspiciousFileVersions = _configService.GetSuspiciousFileVersions();
+                var suspiciousOriginalFilenames = _configService.GetSuspiciousOriginalFilenames();
+                
+                // Проверяем версию файла
+                if (!string.IsNullOrEmpty(fileProps.FileVersion))
+                {
+                    foreach (var pattern in suspiciousFileVersions)
+                    {
+                        if (Regex.IsMatch(fileProps.FileVersion, pattern, RegexOptions.IgnoreCase))
+                        {
+                            reason = $"Подозрительная версия файла: {fileProps.FileVersion} (паттерн: {pattern})";
+                            return true;
+                        }
+                    }
+                }
+                
+                // Проверяем оригинальное имя файла
+                if (!string.IsNullOrEmpty(fileProps.OriginalFilename))
+                {
+                    foreach (var pattern in suspiciousOriginalFilenames)
+                    {
+                        if (Regex.IsMatch(fileProps.OriginalFilename, pattern, RegexOptions.IgnoreCase))
+                        {
+                            reason = $"Подозрительное оригинальное имя файла: {fileProps.OriginalFilename} (паттерн: {pattern})";
+                            return true;
+                        }
+                    }
+                }
+                
+                // Проверяем специфические комбинации свойств
+                if (fileProps.Type == "Application" && 
+                    !string.IsNullOrEmpty(fileProps.OriginalFilename) &&
+                    fileProps.OriginalFilename.Contains("VisualStudio.Shell.Framework.dll"))
+                {
+                    reason = $"Подозрительное приложение с оригинальным именем VisualStudio.Shell.Framework.dll";
+                    return true;
+                }
+                
+                return false;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogDebug(ex, "Ошибка при проверке свойств файла");
+                return false;
+            }
+        }
         
         private async Task WriteToLogAsync(List<SuspiciousProcess> suspiciousProcesses, List<SuspiciousProcess> newSuspiciousProcesses, int totalProcessesScanned)
         {
@@ -491,6 +616,19 @@ namespace VirusDetect
                             await writer.WriteLineAsync($"Путь: {process.MainModulePath ?? "Неизвестно"}");
                             await writer.WriteLineAsync($"Причина: {process.DetectionReason}");
                             await writer.WriteLineAsync($"Время обнаружения: {process.DetectionTime:yyyy-MM-dd HH:mm:ss}");
+                            
+                            // Записываем свойства файла если они есть
+                            if (process.FileProperties != null)
+                            {
+                                await writer.WriteLineAsync($"Свойства файла:");
+                                await writer.WriteLineAsync($"  Тип: {process.FileProperties.Type ?? "Неизвестно"}");
+                                await writer.WriteLineAsync($"  Версия файла: {process.FileProperties.FileVersion ?? "Неизвестно"}");
+                                await writer.WriteLineAsync($"  Оригинальное имя: {process.FileProperties.OriginalFilename ?? "Неизвестно"}");
+                                await writer.WriteLineAsync($"  Компания: {process.FileProperties.CompanyName ?? "Неизвестно"}");
+                                await writer.WriteLineAsync($"  Продукт: {process.FileProperties.ProductName ?? "Неизвестно"}");
+                                await writer.WriteLineAsync($"  Описание: {process.FileProperties.Description ?? "Неизвестно"}");
+                            }
+                            
                             await writer.WriteLineAsync(new string('-', 50));
                         }
                         await writer.WriteLineAsync();
@@ -564,7 +702,20 @@ namespace VirusDetect
         public bool CheckProcessName => _configuration.GetValue<bool>("DetectionSettings:CheckProcessName", true);
         public bool CheckProcessPath => _configuration.GetValue<bool>("DetectionSettings:CheckProcessPath", true);
         public bool CheckMultipleExeExtensions => _configuration.GetValue<bool>("DetectionSettings:CheckMultipleExeExtensions", true);
+        public bool CheckFileProperties => _configuration.GetValue<bool>("DetectionSettings:CheckFileProperties", true);
         public bool LogNewSuspiciousProcesses => _configuration.GetValue<bool>("MonitoringSettings:LogNewSuspiciousProcesses", true);
+
+        public string[] GetSuspiciousFileVersions()
+        {
+            return _configuration.GetSection("DetectionSettings:SuspiciousFileVersions").Get<string[]>() ?? 
+                   new[] { @"16\.10\.31418\.88", @"16\.\d+\.\d+\.\d+" };
+        }
+
+        public string[] GetSuspiciousOriginalFilenames()
+        {
+            return _configuration.GetSection("DetectionSettings:SuspiciousOriginalFilenames").Get<string[]>() ?? 
+                   new[] { @"VisualStudio\.Shell\.Framework\.dll", @"Microsoft\.VisualStudio\.Shell\.Framework\.dll" };
+        }
         
         // Настройки безопасности
         public bool AutoKillSuspiciousProcesses => _configuration.GetValue<bool>("SecuritySettings:AutoKillSuspiciousProcesses", false);
@@ -1609,6 +1760,17 @@ namespace VirusDetect
         public string? MainModulePath { get; set; }
         public string DetectionReason { get; set; } = "";
         public DateTime DetectionTime { get; set; }
+        public FileProperties? FileProperties { get; set; }
+    }
+
+    public class FileProperties
+    {
+        public string? Type { get; set; }
+        public string? FileVersion { get; set; }
+        public string? OriginalFilename { get; set; }
+        public string? CompanyName { get; set; }
+        public string? ProductName { get; set; }
+        public string? Description { get; set; }
     }
 
     // Windows API методы для работы с файлами
